@@ -3,11 +3,11 @@ out vec4 FragColor;
 
 // PBR材质
 struct PBRMaterial {
-    sampler2D albedoMap;
-    sampler2D normalMap;
-    sampler2D metallicMap;
-    sampler2D roughnessMap;
-    sampler2D aoMap;
+    sampler2D albedoMap;      // 基础颜色/反照率
+    sampler2D normalMap;      // 法线贴图
+    sampler2D metallicMap;    // 金属度贴图
+    sampler2D roughnessMap;  // 粗糙度贴图
+    sampler2D aoMap;         // 环境光遮蔽贴图
 };
 
 // 聚光灯
@@ -35,6 +35,15 @@ uniform PBRMaterial material;
 uniform Light light[8];
 uniform vec3 viewPos;
 
+uniform vec3 ballPos;         // 镜球位置
+uniform float ballRotation;   // 镜球旋转角度
+uniform bool renderSpots;     // 是否渲染光斑开关
+uniform vec3 spotColor;       // 光斑颜色
+
+//镜球自发光
+uniform vec3 emissiveColor;     // 自发光颜色 (例如 vec3(1.0, 1.0, 1.0))
+uniform float emissiveIntensity; // 自发光强度 (通常设为 > 1.0 以触发 Bloom)
+
 // IBL Uniforms - 必需
 uniform samplerCube irradianceMap;      // 漫反射辐照度
 uniform samplerCube prefilterMap;       // 预滤波镜面反射
@@ -43,6 +52,20 @@ uniform sampler2D brdfLUT;              // BRDF查找表
 // 常量
 const float PI = 3.14159265359;
 const float MAX_REFLECTION_LOD = 4.0;
+
+// 简单的伪随机函数
+float hash(vec3 p) {
+    p = fract(p * 0.3183099 + 0.1);
+    p *= 17.0;
+    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+// 简单的旋转函数
+vec3 rotateY(vec3 v, float angle) {
+    float s = sin(angle);
+    float c = cos(angle);
+    return vec3(v.x * c - v.z * s, v.y, v.x * s + v.z * c);
+}
 
 // 法线分布函数（GGX/Trowbridge-Reitz）
 float DistributionGGX(vec3 N, vec3 H, float roughness) {
@@ -152,9 +175,6 @@ void main() {
             }
         }
     }
-    
-    // 环境光（简化）
-    //vec3 ambient = vec3(0.1) * albedo * ao;
 
     // ========== IBL 环境光照（完整版本）==========
     // 1. 计算Fresnel项（考虑粗糙度）
@@ -193,7 +213,63 @@ void main() {
     // vec3 color = ambient + (1.0 - shadow) * Lo;
     
     // ====== 直接计算颜色（无阴影） ======
-    vec3 color = ambient + Lo;
+    // 计算自发光项
+    vec3 emissive = emissiveColor * emissiveIntensity * albedo * metallic ;
+
+    //光斑
+    vec3 finalSpots = vec3(0.0);
+
+  if (renderSpots) {
+    vec3 N = normalize(Normal); 
+    
+    vec3 worldPosToBall = FragPos - ballPos;
+    vec3 dir = normalize(worldPosToBall + N * 0.5); // 0.5 是扰动强度
+
+        //vec3 dir = normalize(FragPos - ballPos);
+        vec3 rotatedDir = rotateY(dir, -ballRotation);
+
+        // --- 核心优化：打破规则感 ---
+        // 1. 缩放坐标
+        vec3 p = rotatedDir * 5.0; 
+        
+        // 2. 使用 floor 锁定每个小方格，给每个格子里生成一个随机点
+        vec3 i = floor(p);
+        vec3 f = fract(p);
+        
+        // 在每个格子里计算一个随机位移，让点不再整齐划一
+        float h = hash(i);
+        
+        // 3. 计算点阵：只有随机值超过一定阈值的格子里才会产生光点
+        // 这样光点就会疏密有致，而不是铺满地面
+        float spot = 0.0;
+        if(h > 0.0) { // 调整这个值可以控制点的稀疏程度
+            // 计算格内像素到随机点中心的距离
+            float distToCenter = length(f - 0.5 + (vec3(h, fract(h*10.0), fract(h*100.0)) - 0.5) * 0.6);
+            spot = smoothstep(0.2, 0.05, distToCenter); 
+        }
+
+        // --- 增加动态感：色散效果 ---
+        // 稍微偏移 R 和 B 通道，让光点边缘有彩色
+        vec3 colorSpots = vec3(
+            spot * 1.2, 
+            spot * (0.9 + h * 0.2), 
+            spot * (0.8 + fract(h*10.0) * 0.4)
+        );
+
+        // 距离衰减
+        float d = distance(FragPos, ballPos);
+        //float attenuation = 1.0 / (1.0 + 0.002 * d * d);
+	float density = 0.20; 
+	float attenuation = exp(-density * d );		//指数衰减
+
+        finalSpots = spotColor * colorSpots * attenuation * 20.0;
+    }
+
+    // 将光斑直接加到 PBR 颜色上
+    vec3 color = ambient + Lo + finalSpots;
+
+    // 将自发光加到 PBR 结果上
+    color = color + emissive;
 
     // Gamma校正 （加上Bloom，去掉Gamma矫正）
     //color = color / (color + vec3(1.0));

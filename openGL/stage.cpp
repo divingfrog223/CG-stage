@@ -13,21 +13,35 @@
 #include "include/model_animation.h"
 #include "include/lamp_controller.h"
 #include "include/ibl.h"
+#include "include/AudioPlayer3D.h"
 
 // 窗口设置
 const unsigned int SCR_WIDTH = 1600;
 const unsigned int SCR_HEIGHT = 1200;
 
 // 全局对象
+
+// 全局3D音频播放器
+AudioPlayer3D audioPlayer3D;
+
 Camera camera(glm::vec3(0.0f, 20.0f, 40.0f));
 LampController lampController;
 SimpleBoneController boneController;
 
+bool gKeyPressed = false;
+bool hKeyPressed = false;
+bool numKeyPressed[NUM_LAMPS] = { false };
+
 // 全局状态
-static bool bKeyPressedLastFrame = true;  // 添加这一行
+
+bool effectsEnabled = true;
+bool effectsKeyPressed = false;
+bool vKeyPressed = false;
+
+static bool bKeyPressedLastFrame = true;  
 bool bloom = true;
 bool bloomKeyPressed = false;
-float exposure = 1.0f;
+float exposure = 0.15f;
 bool resetMouseNextFrame = false;
 float lastX = SCR_WIDTH / 2.0f;
 float lastY = SCR_HEIGHT / 2.0f;
@@ -62,6 +76,14 @@ unsigned int quadVAO = 0, quadVBO = 0;
 Shader* bloomShader = nullptr;
 Shader* blurShader = nullptr;
 Shader* combineShader = nullptr;
+
+// 色相转RGB
+glm::vec3 hueToRGB(float h) {
+    float r = abs(h * 6.0f - 3.0f) - 1.0f;
+    float g = 2.0f - abs(h * 6.0f - 2.0f);
+    float b = 2.0f - abs(h * 6.0f - 4.0f);
+    return glm::clamp(glm::vec3(r, g, b), 0.0f, 1.0f);
+}
 
 // 创建全屏四边形
 void SetupQuad() {
@@ -223,8 +245,8 @@ PBRTextures LoadPBRTextures() {
     return tex;
 }
 
-// 镜球位置，在全局变量区域添加
-glm::vec3 mirrorBallPosition = glm::vec3(0.0f, 25.0f, 0.0f);  // 舞台中央上方25单位
+// 镜球位置
+glm::vec3 mirrorBallPosition = glm::vec3(0.0f, 25.0f, 0.0f); 
 float mirrorBallRotation = 0.0f;  // 初始旋转角度
 float rotationSpeed = 20.0f;  // 旋转速度（度/秒）
 
@@ -254,16 +276,6 @@ int main() {
 
     // 3. 加载IBL
     ibl = LoadIBLFromHDR("assets/hdri/citrus_orchard_puresky_2k.hdr");
-    // 添加检查
-    if (ibl.envCubemap == 0 || ibl.irradianceMap == 0 ||
-        ibl.prefilterMap == 0 || ibl.brdfLUTTexture == 0) {
-        std::cerr << "[ERROR] IBL textures not created properly!" << std::endl;
-        std::cerr << "  envCubemap: " << ibl.envCubemap << std::endl;
-        std::cerr << "  irradianceMap: " << ibl.irradianceMap << std::endl;
-        std::cerr << "  prefilterMap: " << ibl.prefilterMap << std::endl;
-        std::cerr << "  brdfLUTTexture: " << ibl.brdfLUTTexture << std::endl;
-        return -1;
-    }
 
     // 4. 设置回调
     glViewport(0, 0, SCR_WIDTH, SCR_HEIGHT);
@@ -276,7 +288,6 @@ int main() {
     Model milkbar("assets/milkbar.fbx");
     Model spotlight("assets/shotlight.fbx");
     Model gan("assets/gan.obj");
-    //Model musicbox4("assets/musicbox4.fbx");
     Model mirrorBall("assets/disco_ball.glb");
     std::cout << "镜球模型加载成功！面数: "
         << mirrorBall.meshes.size() << " 个网格" << std::endl;
@@ -284,6 +295,15 @@ int main() {
     // 6. 初始化骨骼和灯具
     boneController.SetupFromModel(spotlight);
     lampController.InitializeLamps(spotlight);
+
+    for (int i = 0; i < NUM_LAMPS; i++) {
+        // 所有灯都开启扫描效果
+        lampController.SetLightEffects(i, false, false, false);
+
+        // 设置灯光模式
+        //lampController.SetLightMode(i, LampController::SCAN);
+        lampController.SetLightMode(i, LampController::STATIC); // 设置为静态模式
+    }
 
     // 7. 加载PBR纹理
     std::cout << "Loading PBR textures..." << std::endl;
@@ -406,6 +426,40 @@ int main() {
     // 11. 启用深度测试
     glEnable(GL_DEPTH_TEST);
 
+    // 初始化3D音频系统
+    std::cout << "\n=== 初始化3D音频系统 ===" << std::endl;
+    if (!audioPlayer3D.init()) {
+        std::cerr << "3D音频系统初始化失败" << std::endl;
+    }
+    else {
+        if (audioPlayer3D.scanAndLoadTracks()) {
+            // 设置监听器初始位置（通常跟随相机）
+            audioPlayer3D.setListenerPosition(camera.Position);
+            audioPlayer3D.setListenerOrientation(
+                camera.Front,  // 看向方向
+                camera.Up      // 向上方向
+            );
+
+            // 打印使用说明
+            std::cout << "\n=== 3D音频控制说明 ===" << std::endl;
+            std::cout << "空格键: 播放/暂停当前音源" << std::endl;
+            std::cout << "左右箭头: 切换音源" << std::endl;
+            std::cout << "上下箭头: 调节音量" << std::endl;
+            std::cout << "M键: 显示音源列表" << std::endl;
+            std::cout << "P键: 将当前音源放置在相机位置" << std::endl;
+            std::cout << "O键: 将当前音源放置在原点" << std::endl;
+            std::cout << "数字键1-9: 放置音源在不同位置" << std::endl;
+            std::cout << "===========================\n" << std::endl;
+
+            audioPlayer3D.printAllTracks();
+
+            // 示例：将第一个音源放在特定位置并播放
+            audioPlayer3D.setCurrentSourcePosition(5.0f, 0.0f, 0.0f); // X轴5米处
+            audioPlayer3D.play();
+        }
+    }
+
+
     // 12. 主渲染循环
     while (!glfwWindowShouldClose(window)) {
 
@@ -419,13 +473,18 @@ int main() {
 
         processInput(window);
 
+        // 更新灯光动态效果
+        if (effectsEnabled) {
+            lampController.UpdateDynamicEffects(deltaTime);
+        }
+
         // 清屏
         glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        // ====== 主渲染 ======
+        // 主渲染 
 
-        // ====== 渲染到HDR帧缓冲 ======
+        // 渲染到HDR帧缓冲
         glBindFramebuffer(GL_FRAMEBUFFER, hdrFBO);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -468,7 +527,7 @@ int main() {
         glBindTexture(GL_TEXTURE_2D, floorTextures.ao);
         modelShader.setInt("material.aoMap", 4);
 
-        //// 绑定IBL纹理
+        // 绑定IBL纹理
         modelShader.setInt("irradianceMap", 5);
         glActiveTexture(GL_TEXTURE5);
         glBindTexture(GL_TEXTURE_CUBE_MAP, ibl.irradianceMap);
@@ -481,6 +540,26 @@ int main() {
         glActiveTexture(GL_TEXTURE7);
         glBindTexture(GL_TEXTURE_2D, ibl.brdfLUTTexture);
 
+        float time = (float)glfwGetTime();
+
+        float hue = fmod(time * 0.2f, 1.0f); // 每5秒循环一次全色谱
+        glm::vec3 partyColor = hueToRGB(hue);
+
+        // 2. 计算剧烈的闪烁强度 (在 1.0 到 4.0 之间快速跳动)
+        // 使用 cos 和 sin 叠加可以让闪烁看起来更随机、不机械
+        float dynamicIntensity = 1.0f + (sin(time * 5.0f) * cos(time * 2.5f) + 1.0f) * 1.5f;
+
+        float ballRotation = time * 0.5f; // 旋转速度
+        glm::vec3 discoBallPos = glm::vec3(0.0f, 20.0f, 43.0f); // 镜球在世界空间的位置
+
+        // 2. 准备渲染地面和墙壁
+        modelShader.use();
+        modelShader.setVec3("ballPos", discoBallPos);
+        modelShader.setFloat("ballRotation", ballRotation);
+        modelShader.setBool("renderSpots", true); // 开启光斑计算
+        // 传入镜球当前的闪烁颜色，让光斑颜色和球同步
+        modelShader.setVec3("spotColor", partyColor);
+
 
         // A. 渲染地面
         glm::mat4 floorModel = glm::mat4(1.0f);
@@ -490,6 +569,8 @@ int main() {
         glBindVertexArray(floorVAO);
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
         glBindVertexArray(0);
+
+        modelShader.setBool("renderSpots", false); // 关闭光斑计算
 
         // B. 渲染所有灯具
         modelShader.setBool("useBones", useBones);
@@ -533,53 +614,7 @@ int main() {
         modelShader.setMat4("model", ganModel);
         gan.Draw(modelShader);
 
-
-
-
-        //// 在渲染镜球前设置特殊材质参数
-        //modelShader.setFloat("material.metallic", 0.9f);   // 高金属度
-        //modelShader.setFloat("material.roughness", 0.2f);  // 低粗糙度（更光滑）
-
-        //mirrorBallShader.use();  // 替换 modelShader.use()
-
-        //// 设置变换矩阵（和以前一样）
-        //mirrorBallShader.setMat4("projection", projection);
-        //mirrorBallShader.setMat4("view", view);
-        //mirrorBallShader.setMat4("model", mirrorModel);
-        //// 设置相机位置
-        //mirrorBallShader.setVec3("viewPos", camera.Position);
-
-        //// 2. 设置灯光（和modelShader一样）
-        //for (int i = 0; i < 8; ++i) {
-        //    std::string prefix = "light[" + std::to_string(i) + "].";
-        //    mirrorBallShader.setVec3(prefix + "position", lampController.lampPositions[i]);
-        //    mirrorBallShader.setVec3(prefix + "direction", lampController.lampLights[i].direction);
-        //    mirrorBallShader.setVec3(prefix + "color", lampController.lampLights[i].color);
-        //    //mirrorBallShader.setFloat(prefix + "strength", lampController.lampLights[i].intensity);
-        //    // 设置其他聚光灯参数...
-        //}
-
-        // 3. 设置IBL纹理（和modelShader一样）
-        //mirrorBallShader.setInt("irradianceMap", 5);
-        //glActiveTexture(GL_TEXTURE5);
-        //glBindTexture(GL_TEXTURE_CUBE_MAP, ibl.irradianceMap);
-
-        //mirrorBallShader.setInt("prefilterMap", 6);
-        //glActiveTexture(GL_TEXTURE6);
-        //glBindTexture(GL_TEXTURE_CUBE_MAP, ibl.prefilterMap);
-
-        //mirrorBallShader.setInt("brdfLUT", 7);
-        //glActiveTexture(GL_TEXTURE7);
-        //glBindTexture(GL_TEXTURE_2D, ibl.brdfLUTTexture);
-
-        // 4. 设置镜球特有参数
-        //mirrorBallShader.setVec3("ballColor", glm::vec3(0.95f, 0.97f, 1.0f)); // 冷白色
-        //mirrorBallShader.setFloat("glowIntensity", 2.0f);     // 发光强度
-        //mirrorBallShader.setFloat("sparkleIntensity", 1.5f);  // 闪烁强度
-        //mirrorBallShader.setFloat("reflectivity", 0.8f);      // 额外反射
-        //mirrorBallShader.setFloat("u_time", glfwGetTime());   // 时间
-
-        // +++ 渲染镜球 +++
+        // 渲染镜球 
         mirrorBallRotation += rotationSpeed * deltaTime;  // 更新旋转角度
 
         glm::mat4 mirrorModel = glm::mat4(1.0f);
@@ -589,14 +624,19 @@ int main() {
         mirrorModel = glm::rotate(mirrorModel, glm::radians(mirrorBallRotation),
             glm::vec3(0.0f, 0.0f, 1.0f));  // 旋转
 
-        //mirrorBallShader.setMat4("model", mirrorModel);
-        //mirrorBall.Draw(mirrorBallShader);
+        // 开启镜球自发光
+        modelShader.setVec3("emissiveColor", partyColor);
+        modelShader.setFloat("emissiveIntensity", dynamicIntensity); // 强度设为2.0，超过Bloom阈值1.0
 
         modelShader.setMat4("model", mirrorModel);
         mirrorBall.Draw(modelShader);
 
+        // 立刻重置自发光，以免影响后续渲染的物体 
+        modelShader.setFloat("emissiveIntensity", 0.0f);
+
 
         // D. 渲染牛奶吧模型
+        modelShader.setBool("renderSpots", true); // 开启光斑计算
         modelShader.use();
 
         glm::mat4 barModel = glm::mat4(1.0f);
@@ -608,17 +648,15 @@ int main() {
 
         modelShader.setMat4("model", barModel);
         milkbar.Draw(modelShader);
+        modelShader.setBool("renderSpots", false); // 关闭光斑计算
 
-
-
-        // ======渲染天空盒（最后渲染） ======
-        // 注意：要先禁用深度写入，天空盒应该总是在背景
+        // 渲染天空盒
+        // 要先禁用深度写入，天空盒应该总是在背景
         glDepthFunc(GL_LEQUAL);  // 深度值<=1.0的都通过
         glDepthMask(GL_FALSE);   // 禁用深度写入
 
         skyboxShader.use();
 
-        // 移除天空盒的平移部分，只保留旋转
         glm::mat4 skyboxView = glm::mat4(glm::mat3(camera.GetViewMatrix()));
 
         skyboxShader.setMat4("view", skyboxView);
@@ -641,47 +679,48 @@ int main() {
 
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-
-        // ====== 第3步：处理Bloom效果（如果需要） ======
+        // 处理Bloom效果
         if (bloom) {
-            // 提取高亮区域
+            // 1. 提取高亮区域 
             bloomShader->use();
             bloomShader->setFloat("threshold", 1.0f);
             glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, colorBuffers[1]); // 第二个附件是亮色
+            glBindTexture(GL_TEXTURE_2D, colorBuffers[0]); 
 
             glBindFramebuffer(GL_FRAMEBUFFER, pingpongFBO[0]);
             RenderQuad();
 
-            // 高斯模糊（Ping-pong技术）
+            // 2. 高斯模糊 
             blurShader->use();
-            unsigned int amount = 10;
+            unsigned int amount = 20; // 光晕
             bool horizontal = true, first_iteration = true;
 
             for (unsigned int i = 0; i < amount; i++) {
                 glBindFramebuffer(GL_FRAMEBUFFER, pingpongFBO[horizontal]);
                 blurShader->setBool("horizontal", horizontal);
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, first_iteration ? pingpongBuffer[!horizontal] : pingpongBuffer[!horizontal]);
+
+                // 绑定上一轮的纹理
+                glBindTexture(GL_TEXTURE_2D, first_iteration ? pingpongBuffer[0] : pingpongBuffer[!horizontal]);
+
                 RenderQuad();
                 horizontal = !horizontal;
-                if (first_iteration) first_iteration = false;
+                first_iteration = false;
             }
 
-            // ====== 第4步：合并Bloom效果 ======
+            // 3. 合并
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
             combineShader->use();
             combineShader->setFloat("exposure", exposure);
+            combineShader->setFloat("bloomStrength", 1.8f); 
+
             glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, colorBuffers[0]); // 场景颜色
+            glBindTexture(GL_TEXTURE_2D, colorBuffers[0]);
             glActiveTexture(GL_TEXTURE1);
-            glBindTexture(GL_TEXTURE_2D, pingpongBuffer[!horizontal]); // 模糊后的Bloom
+            glBindTexture(GL_TEXTURE_2D, pingpongBuffer[!horizontal]);
             RenderQuad();
         }
         else {
-            // ====== 第4步：如果不使用Bloom，直接渲染HDR场景 ======
+            //  如果不使用Bloom，直接渲染HDR场景 
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -727,29 +766,66 @@ void processInput(GLFWwindow* window) {
         glfwSetWindowShouldClose(window, true);
 
     // ====== 灯具控制模式切换 ======
-    if (glfwGetKey(window, GLFW_KEY_K) == GLFW_PRESS && !lampKeyPressed) {
-        lampControlMode = !lampControlMode;
-        isAnimating = lampControlMode;
-        std::cout << (lampControlMode ? "进入灯具控制模式" : "退出灯具控制模式") << std::endl;
-        lampKeyPressed = true;
-
-        if (lampControlMode) {
-            glfwSetCursorPos(window, SCR_WIDTH / 2, SCR_HEIGHT / 2);
-            resetMouseNextFrame = true;
-        }
+// G键：切换渐变效果
+    if (glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS && !gKeyPressed) {
+        lampController.ToggleGradientForAll();
+        gKeyPressed = true;
+    }
+    if (glfwGetKey(window, GLFW_KEY_G) == GLFW_RELEASE) {
+        gKeyPressed = false;
     }
 
+    // H键：切换呼吸效果
+    if (glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS && !hKeyPressed) {
+        lampController.ToggleBreathForAll();
+        hKeyPressed = true;
+    }
+    if (glfwGetKey(window, GLFW_KEY_H) == GLFW_RELEASE) {
+        hKeyPressed = false;
+    }
+
+    // K键：灯具控制模式切换
+    if (glfwGetKey(window, GLFW_KEY_K) == GLFW_PRESS && !lampKeyPressed) {
+        lampControlMode = !lampControlMode;
+
+        if (lampControlMode) {
+            // 进入手动控制：当前选中的灯暂停自动效果
+            lampController.SetManualControl(currentLampIndex, true);
+            std::cout << "进入灯具控制模式 - 控制灯 " << (currentLampIndex + 1) << std::endl;
+        }
+        else {
+            // 退出手动控制：恢复自动效果
+            lampController.SetManualControl(currentLampIndex, false);
+            std::cout << "退出灯具控制模式" << std::endl;
+        }
+
+        lampKeyPressed = true;
+    }
+    //  添加K键释放检测
     if (glfwGetKey(window, GLFW_KEY_K) == GLFW_RELEASE) {
         lampKeyPressed = false;
     }
-
-    // ====== 数字键选择灯具 ======
+    // 数字键选择灯具
     for (int i = 0; i < NUM_LAMPS; i++) {
-        if (glfwGetKey(window, GLFW_KEY_1 + i) == GLFW_PRESS) {
+        if (glfwGetKey(window, GLFW_KEY_1 + i) == GLFW_PRESS && !numKeyPressed[i]) {
+            // 如果之前有灯在手动控制，先退出控制
+            if (lampControlMode) {
+                lampController.SetManualControl(currentLampIndex, false);
+            }
+
             currentLampIndex = i;
-            std::cout << "切换到灯具: " << (currentLampIndex + 1)
-                << " 角度(X:" << lampController.lampRotationX[currentLampIndex]
-                << " Y:" << lampController.lampRotationY[currentLampIndex] << ")" << std::endl;
+
+            // 如果当前在控制模式，新选中的灯进入控制
+            if (lampControlMode) {
+                lampController.SetManualControl(currentLampIndex, true);
+            }
+
+            std::cout << "切换到灯具: " << (currentLampIndex + 1) << std::endl;
+            numKeyPressed[i] = true;
+        }
+
+        if (glfwGetKey(window, GLFW_KEY_1 + i) == GLFW_RELEASE) {
+            numKeyPressed[i] = false;
         }
     }
 
@@ -817,6 +893,107 @@ void processInput(GLFWwindow* window) {
         exposure += deltaTime * 2.0f;
         if (exposure > 5.0f) exposure = 5.0f;
         std::cout << "Exposure: " << exposure << std::endl;
+    }
+
+    // 速度控制
+    if (glfwGetKey(window, GLFW_KEY_U) == GLFW_PRESS) {
+        lampController.SetGradientSpeed(lampController.GetGradientSpeed() * 1.1f);
+        std::cout << "渐变速度: " << lampController.GetGradientSpeed() << std::endl;
+    }
+    if (glfwGetKey(window, GLFW_KEY_I) == GLFW_PRESS) {
+        lampController.SetGradientSpeed(lampController.GetGradientSpeed() * 0.9f);
+        std::cout << "渐变速度: " << lampController.GetGradientSpeed() << std::endl;
+    }
+
+    // 3D音频控制
+    static bool spacePressed = false;
+    static bool rightPressed = false;
+    static bool leftPressed = false;
+    static bool upPressed = false;
+    static bool downPressed = false;
+    static bool mPressed = false;
+    static bool pPressed = false;
+    static bool oPressed = false;
+
+    // 空格键：播放/暂停
+    if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS && !spacePressed) {
+        audioPlayer3D.togglePlayPause();
+        spacePressed = true;
+    }
+    if (glfwGetKey(window, GLFW_KEY_R) == GLFW_RELEASE) spacePressed = false;
+
+    // 箭头键控制
+    if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS && !rightPressed) {
+        audioPlayer3D.nextTrack();
+        rightPressed = true;
+    }
+    if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_RELEASE) rightPressed = false;
+
+    if (glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS && !leftPressed) {
+        audioPlayer3D.previousTrack();
+        leftPressed = true;
+    }
+    if (glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_RELEASE) leftPressed = false;
+
+    if (glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS && !upPressed) {
+        audioPlayer3D.increaseVolume();
+        upPressed = true;
+    }
+    if (glfwGetKey(window, GLFW_KEY_UP) == GLFW_RELEASE) upPressed = false;
+
+    if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS && !downPressed) {
+        audioPlayer3D.decreaseVolume();
+        downPressed = true;
+    }
+    if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_RELEASE) downPressed = false;
+
+    // M键：显示音源信息
+    if (glfwGetKey(window, GLFW_KEY_M) == GLFW_PRESS && !mPressed) {
+        audioPlayer3D.printAllTracks();
+        mPressed = true;
+    }
+    if (glfwGetKey(window, GLFW_KEY_M) == GLFW_RELEASE) mPressed = false;
+
+    // P键：将音源放在相机位置
+    if (glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS && !pPressed) {
+        audioPlayer3D.setCurrentSourcePosition(camera.Position);
+        std::cout << "音源已放置在相机位置: ("
+            << camera.Position.x << ", "
+            << camera.Position.y << ", "
+            << camera.Position.z << ")" << std::endl;
+        pPressed = true;
+    }
+    if (glfwGetKey(window, GLFW_KEY_P) == GLFW_RELEASE) pPressed = false;
+
+    // O键：将音源放在原点
+    if (glfwGetKey(window, GLFW_KEY_O) == GLFW_PRESS && !oPressed) {
+        audioPlayer3D.setCurrentSourcePosition(0.0f, 0.0f, 0.0f);
+        std::cout << "音源已放置在原点" << std::endl;
+        oPressed = true;
+    }
+    if (glfwGetKey(window, GLFW_KEY_O) == GLFW_RELEASE) oPressed = false;
+
+    // 数字键：将音源放在预设位置
+    for (int i = 0; i < 9; i++) {
+        static bool numPressed[9] = { false };
+        if (glfwGetKey(window, GLFW_KEY_1 + i) == GLFW_PRESS && !numPressed[i]) {
+            // 预设位置：在X轴上等间距排列
+            float x = -10.0f + i * 2.5f;
+            audioPlayer3D.setCurrentSourcePosition(x, 0.0f, 0.0f);
+            std::cout << "音源放置在: (" << x << ", 0.0, 0.0)" << std::endl;
+            numPressed[i] = true;
+        }
+        if (glfwGetKey(window, GLFW_KEY_1 + i) == GLFW_RELEASE) {
+            numPressed[i] = false;
+        }
+    }
+
+    if (glfwGetKey(window, GLFW_KEY_V) == GLFW_PRESS && !vKeyPressed) {
+        lampController.ToggleScanForAll(); // 切换所有灯的扫描效果
+        vKeyPressed = true;
+    }
+    if (glfwGetKey(window, GLFW_KEY_V) == GLFW_RELEASE) {
+        vKeyPressed = false;
     }
 
 }
@@ -902,8 +1079,6 @@ void mouse_callback(GLFWwindow* window, double xposIn, double yposIn) {
 void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
     camera.ProcessMouseScroll(static_cast<float>(yoffset));
 }
-
-// 在 stage.cpp 文件的最后（scroll_callback函数之后）添加：
 
 void RenderCube()
 {

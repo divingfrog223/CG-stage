@@ -1,0 +1,16 @@
+.vs/
+Debug/
+Release/
+x64/
+bin/
+bin-int/
+*.user
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.log
+
+audio/
+sndfile.dll
+openGL/include/AL/
